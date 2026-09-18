@@ -24,34 +24,41 @@ const telegramMessageLimit = 4000
 type AccessService interface {
 	Start(ctx context.Context, user domain.User) (domain.Profile, error)
 	Status(ctx context.Context, telegramID int64) (domain.Profile, error)
-	Buy(ctx context.Context, user domain.User) (domain.Checkout, error)
-	Extend(ctx context.Context, user domain.User) (domain.Checkout, error)
-	ConfirmPaymentCode(ctx context.Context, user domain.User, code string) (domain.Subscription, error)
+	Buy(ctx context.Context, user domain.User, updateID int64) (domain.Checkout, error)
+	Extend(ctx context.Context, user domain.User, updateID int64) (domain.Checkout, error)
+	ConfirmPaymentCode(ctx context.Context, user domain.User, code string, updateID int64) (domain.Subscription, error)
 	GetConfig(ctx context.Context, telegramID int64, displayName string) (domain.Access, error)
 	RefreshConfig(ctx context.Context, telegramID int64, displayName string) (domain.Access, error)
 }
 
 type Bot struct {
 	baseURL     string
+	token       string
 	pollTimeout time.Duration
 	httpClient  *http.Client
 	service     AccessService
 	logger      *slog.Logger
+	location    *time.Location
 }
 
-func New(token string, pollTimeout time.Duration, service AccessService, logger *slog.Logger) (*Bot, error) {
+func New(token string, pollTimeout time.Duration, service AccessService, logger *slog.Logger, location *time.Location) (*Bot, error) {
 	if token == "" {
 		return nil, fmt.Errorf("Telegram token is empty")
 	}
 	if service == nil {
 		return nil, fmt.Errorf("access service is nil")
 	}
+	if location == nil {
+		return nil, fmt.Errorf("display timezone is nil")
+	}
 	return &Bot{
 		baseURL:     "https://api.telegram.org/bot" + token,
+		token:       token,
 		pollTimeout: pollTimeout,
 		httpClient:  &http.Client{Timeout: pollTimeout + 10*time.Second},
 		service:     service,
 		logger:      logger,
+		location:    location,
 	}, nil
 }
 
@@ -75,14 +82,20 @@ func (b *Bot) Run(ctx context.Context) error {
 			if update.Message == nil || update.Message.From == nil {
 				continue
 			}
-			if err := b.handleMessage(ctx, *update.Message); err != nil {
+			if err := b.handleMessage(ctx, update.ID, *update.Message); err != nil {
 				b.logger.Error("handle Telegram message", "error", err, "update_id", update.ID)
 			}
 		}
 	}
 }
 
-func (b *Bot) handleMessage(ctx context.Context, message message) error {
+func (b *Bot) handleMessage(ctx context.Context, updateID int64, message message) error {
+	// VPN credentials and beta payment codes must never be exposed in a group.
+	// Keep this guard even when BotFather group access is disabled: platform
+	// settings can be changed independently from a deployment.
+	if message.Chat.Type != "private" {
+		return nil
+	}
 	fields := strings.Fields(message.Text)
 	if len(fields) == 0 {
 		return b.sendText(ctx, message.Chat.ID, "Используйте /help, чтобы увидеть команды.")
@@ -98,14 +111,14 @@ func (b *Bot) handleMessage(ctx context.Context, message message) error {
 		if err != nil {
 			return b.replyError(ctx, message.Chat.ID, err)
 		}
-		return b.sendText(ctx, message.Chat.ID, "Вы зарегистрированы.\n\n"+formatProfile(profile)+"\n\n"+helpText())
+		return b.sendText(ctx, message.Chat.ID, "Вы зарегистрированы.\n\n"+formatProfile(profile, b.location)+"\n\n"+helpText())
 	case "/help":
 		return b.sendText(ctx, message.Chat.ID, helpText())
 	case "/buy":
-		checkout, err := b.service.Buy(ctx, message.From.domainUser())
+		checkout, err := b.service.Buy(ctx, message.From.domainUser(), updateID)
 		return b.sendCheckout(ctx, message.Chat.ID, checkout, err)
 	case "/extend":
-		checkout, err := b.service.Extend(ctx, message.From.domainUser())
+		checkout, err := b.service.Extend(ctx, message.From.domainUser(), updateID)
 		if errors.Is(err, usecase.ErrSubscriptionRequired) {
 			return b.sendText(ctx, message.Chat.ID, "Активной подписки нет. Используйте /buy.")
 		}
@@ -136,14 +149,17 @@ func (b *Bot) handleMessage(ctx context.Context, message message) error {
 		if err != nil {
 			return b.replyError(ctx, message.Chat.ID, err)
 		}
-		return b.sendText(ctx, message.Chat.ID, formatProfile(profile))
+		return b.sendText(ctx, message.Chat.ID, formatProfile(profile, b.location))
 	default:
 		if strings.HasPrefix(command, "/") {
 			return b.sendText(ctx, message.Chat.ID, "Неизвестная команда. Используйте /help.")
 		}
-		subscription, err := b.service.ConfirmPaymentCode(ctx, message.From.domainUser(), message.Text)
+		subscription, err := b.service.ConfirmPaymentCode(ctx, message.From.domainUser(), message.Text, updateID)
 		if errors.Is(err, usecase.ErrInvalidPaymentCode) {
 			return b.sendText(ctx, message.Chat.ID, "Неверный код. Попробуйте ещё раз.")
+		}
+		if errors.Is(err, usecase.ErrPaymentCodeRateLimit) {
+			return b.sendText(ctx, message.Chat.ID, "Слишком много неверных попыток. Повторите через 15 минут.")
 		}
 		if errors.Is(err, usecase.ErrNoPendingPayment) {
 			return b.sendText(ctx, message.Chat.ID, "Нет покупки, ожидающей подтверждения. Используйте /buy.")
@@ -152,7 +168,7 @@ func (b *Bot) handleMessage(ctx context.Context, message message) error {
 			return b.replyError(ctx, message.Chat.ID, err)
 		}
 		return b.sendText(ctx, message.Chat.ID,
-			"Код принят. Подписка активна до "+subscription.ExpiresAt.Local().Format("02.01.2006 15:04")+".\nИспользуйте /config, чтобы получить конфигурацию.")
+			"Код принят. Подписка активна до "+subscription.ExpiresAt.In(b.location).Format("02.01.2006 15:04")+".\nИспользуйте /config, чтобы получить конфигурацию.")
 	}
 }
 
@@ -170,7 +186,7 @@ func (b *Bot) sendCheckout(ctx context.Context, chatID int64, checkout domain.Ch
 }
 
 func (b *Bot) sendAccess(ctx context.Context, chatID int64, access domain.Access) error {
-	if err := b.sendText(ctx, chatID, formatStatus(access.Client)); err != nil {
+	if err := b.sendText(ctx, chatID, formatStatus(access.Client, b.location)); err != nil {
 		return err
 	}
 	if len(access.Links) == 0 {
@@ -263,7 +279,9 @@ func (b *Bot) sendHTML(ctx context.Context, chatID int64, text string) error {
 func (b *Bot) do(req *http.Request, target any) error {
 	resp, err := b.httpClient.Do(req)
 	if err != nil {
-		return err
+		// net/http errors contain the complete request URL. Telegram embeds the
+		// bot token in that URL, so returning the raw error would leak it to logs.
+		return fmt.Errorf("Telegram API request failed: %s", strings.ReplaceAll(err.Error(), b.token, "[REDACTED]"))
 	}
 	defer resp.Body.Close()
 	data, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
@@ -286,11 +304,11 @@ func (b *Bot) do(req *http.Request, target any) error {
 	return nil
 }
 
-func formatStatus(client domain.Client) string {
+func formatStatus(client domain.Client, location *time.Location) string {
 	status := "активен"
 	if !client.Enabled {
 		status = "отключён"
-	} else if client.IsExpired(time.Now()) {
+	} else if client.IsExpired(time.Now().In(location)) {
 		status = "истёк"
 	} else if client.IsExhausted() {
 		status = "трафик исчерпан"
@@ -305,20 +323,21 @@ func formatStatus(client domain.Client) string {
 	if client.ExpiryAt.IsZero() {
 		lines = append(lines, "Срок: без ограничений")
 	} else {
-		lines = append(lines, "Действует до: "+client.ExpiryAt.Local().Format("02.01.2006 15:04"))
+		lines = append(lines, "Действует до: "+client.ExpiryAt.In(location).Format("02.01.2006 15:04"))
 	}
 	return strings.Join(lines, "\n")
 }
 
-func formatProfile(profile domain.Profile) string {
+func formatProfile(profile domain.Profile, location *time.Location) string {
 	if profile.Subscription == nil {
 		return "Подписка: отсутствует\nДля покупки используйте /buy."
 	}
 	subscription := profile.Subscription
 	state := "неактивна"
-	if subscription.IsActive(time.Now()) {
+	now := time.Now().In(location)
+	if subscription.IsActive(now) {
 		state = "активна"
-	} else if subscription.Status == domain.SubscriptionExpired || (!subscription.ExpiresAt.IsZero() && !time.Now().Before(subscription.ExpiresAt)) {
+	} else if subscription.Status == domain.SubscriptionExpired || (!subscription.ExpiresAt.IsZero() && !now.Before(subscription.ExpiresAt)) {
 		state = "истекла"
 	} else if subscription.Status == domain.SubscriptionPending {
 		state = "ожидает оплаты"
@@ -329,7 +348,7 @@ func formatProfile(profile domain.Profile) string {
 	if subscription.ExpiresAt.IsZero() {
 		lines = append(lines, "Действует: без ограничения срока")
 	} else {
-		lines = append(lines, "Действует до: "+subscription.ExpiresAt.Local().Format("02.01.2006 15:04"))
+		lines = append(lines, "Действует до: "+subscription.ExpiresAt.In(location).Format("02.01.2006 15:04"))
 	}
 	if subscription.QuotaBytes == 0 {
 		lines = append(lines, "Трафик: без ограничений")
@@ -397,7 +416,8 @@ type message struct {
 }
 
 type chat struct {
-	ID int64 `json:"id"`
+	ID   int64  `json:"id"`
+	Type string `json:"type"`
 }
 
 type user struct {

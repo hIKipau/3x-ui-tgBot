@@ -14,6 +14,11 @@ import (
 
 const betaPaymentProvider = "beta_code"
 
+const (
+	maxPaymentCodeFailures = 5
+	paymentCodeBlockPeriod = 15 * time.Minute
+)
+
 type Repository struct {
 	*PostgreSQL
 }
@@ -47,10 +52,28 @@ func (r *Repository) UpsertUser(ctx context.Context, user domain.User) (domain.U
 	return user, nil
 }
 
+func (r *Repository) UserByTelegramID(ctx context.Context, telegramID int64) (domain.User, bool, error) {
+	var user domain.User
+	err := r.pool.QueryRow(ctx, `
+		SELECT telegram_id, username, first_name, last_name, language_code, created_at, updated_at
+		FROM users WHERE telegram_id = $1`, telegramID,
+	).Scan(
+		&user.TelegramID, &user.Username, &user.FirstName, &user.LastName,
+		&user.LanguageCode, &user.CreatedAt, &user.UpdatedAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.User{}, false, nil
+	}
+	if err != nil {
+		return domain.User{}, false, fmt.Errorf("query Telegram user %d: %w", telegramID, err)
+	}
+	return user, true, nil
+}
+
 func (r *Repository) LatestSubscription(ctx context.Context, telegramID int64) (domain.Subscription, bool, error) {
 	const query = `
 		SELECT id, user_telegram_id, plan_code, status, starts_at, expires_at,
-		       quota_bytes, xui_email, created_at, updated_at
+		       quota_bytes, created_at, updated_at
 		FROM subscriptions
 		WHERE user_telegram_id = $1
 		ORDER BY created_at DESC, id DESC
@@ -61,7 +84,7 @@ func (r *Repository) LatestSubscription(ctx context.Context, telegramID int64) (
 func (r *Repository) ActiveSubscription(ctx context.Context, telegramID int64, now time.Time) (domain.Subscription, bool, error) {
 	const query = `
 		SELECT id, user_telegram_id, plan_code, status, starts_at, expires_at,
-		       quota_bytes, xui_email, created_at, updated_at
+		       quota_bytes, created_at, updated_at
 		FROM subscriptions
 		WHERE user_telegram_id = $1
 		  AND status = 'active'
@@ -84,7 +107,6 @@ func (r *Repository) querySubscription(ctx context.Context, query string, args .
 		&startsAt,
 		&expiresAt,
 		&subscription.QuotaBytes,
-		&subscription.XUIEmail,
 		&subscription.CreatedAt,
 		&subscription.UpdatedAt,
 	)
@@ -103,17 +125,32 @@ func (r *Repository) querySubscription(ctx context.Context, query string, args .
 	return subscription, true, nil
 }
 
-func (r *Repository) BindXUIClient(ctx context.Context, subscriptionID int64, email string) error {
-	const query = `
-		UPDATE subscriptions
-		SET xui_email = $2, updated_at = now()
-		WHERE id = $1 AND status = 'active'`
-	result, err := r.pool.Exec(ctx, query, subscriptionID, email)
-	if err != nil {
-		return fmt.Errorf("bind 3x-ui client to subscription %d: %w", subscriptionID, err)
+func (r *Repository) VPNAccountEmail(ctx context.Context, telegramID int64) (string, bool, error) {
+	var email string
+	err := r.pool.QueryRow(ctx, `
+		SELECT xui_email
+		FROM vpn_accounts
+		WHERE user_telegram_id = $1`, telegramID,
+	).Scan(&email)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", false, nil
 	}
-	if result.RowsAffected() != 1 {
-		return fmt.Errorf("bind 3x-ui client: active subscription %d not found", subscriptionID)
+	if err != nil {
+		return "", false, fmt.Errorf("query VPN account: %w", err)
+	}
+	return email, true, nil
+}
+
+func (r *Repository) BindXUIClient(ctx context.Context, telegramID int64, email string) error {
+	const query = `
+		INSERT INTO vpn_accounts (user_telegram_id, xui_email)
+		VALUES ($1, $2)
+		ON CONFLICT (user_telegram_id) DO UPDATE SET
+			xui_email = EXCLUDED.xui_email,
+			updated_at = now()`
+	_, err := r.pool.Exec(ctx, query, telegramID, email)
+	if err != nil {
+		return fmt.Errorf("bind 3x-ui client to Telegram user %d: %w", telegramID, err)
 	}
 	return nil
 }
@@ -124,6 +161,23 @@ func (r *Repository) CreatePendingPayment(ctx context.Context, request domain.Ch
 		return fmt.Errorf("begin payment transaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	if err := lockUser(ctx, tx, request.User.TelegramID); err != nil {
+		return err
+	}
+	var existingUserID int64
+	err = tx.QueryRow(ctx, `
+		SELECT user_telegram_id FROM payments WHERE idempotency_key = $1`,
+		request.IdempotencyKey,
+	).Scan(&existingUserID)
+	if err == nil {
+		if existingUserID != request.User.TelegramID {
+			return fmt.Errorf("payment idempotency key belongs to another user")
+		}
+		return tx.Commit(ctx)
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("check payment idempotency: %w", err)
+	}
 
 	if _, err := tx.Exec(ctx, `
 		UPDATE payments
@@ -155,12 +209,36 @@ func (r *Repository) CreatePendingPayment(ctx context.Context, request domain.Ch
 	return nil
 }
 
-func (r *Repository) CompletePendingPayment(ctx context.Context, telegramID int64, plan domain.Plan, now time.Time) (domain.Subscription, bool, error) {
+func (r *Repository) CompletePendingPayment(ctx context.Context, telegramID, updateID int64, plan domain.Plan, now time.Time) (domain.Subscription, bool, error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return domain.Subscription{}, false, fmt.Errorf("begin payment confirmation: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	if err := lockUser(ctx, tx, telegramID); err != nil {
+		return domain.Subscription{}, false, err
+	}
+	if updateID > 0 {
+		var replayed domain.Subscription
+		err = scanSubscription(tx.QueryRow(ctx, `
+			SELECT subscription.id, subscription.user_telegram_id, subscription.plan_code,
+			       subscription.status, subscription.starts_at, subscription.expires_at,
+			       subscription.quota_bytes, subscription.created_at, subscription.updated_at
+			FROM telegram_payment_confirmations AS confirmation
+			JOIN subscriptions AS subscription ON subscription.id = confirmation.subscription_id
+			WHERE confirmation.update_id = $1 AND confirmation.user_telegram_id = $2`,
+			updateID, telegramID,
+		), &replayed)
+		if err == nil {
+			if err := tx.Commit(ctx); err != nil {
+				return domain.Subscription{}, false, fmt.Errorf("commit replayed payment lookup: %w", err)
+			}
+			return replayed, true, nil
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return domain.Subscription{}, false, fmt.Errorf("check payment confirmation idempotency: %w", err)
+		}
+	}
 
 	var paymentID, preferredSubscriptionID int64
 	err = tx.QueryRow(ctx, `
@@ -196,7 +274,7 @@ func (r *Repository) CompletePendingPayment(ctx context.Context, telegramID int6
 			    quota_bytes = $5, updated_at = now()
 			WHERE id = $1
 			RETURNING id, user_telegram_id, plan_code, status, starts_at,
-			          expires_at, quota_bytes, xui_email, created_at, updated_at`,
+			          expires_at, quota_bytes, created_at, updated_at`,
 			subscription.ID, plan.Code, now, expiresAt, plan.QuotaBytes,
 		), &subscription)
 	} else {
@@ -205,7 +283,7 @@ func (r *Repository) CompletePendingPayment(ctx context.Context, telegramID int6
 				user_telegram_id, plan_code, status, starts_at, expires_at, quota_bytes
 			) VALUES ($1, $2, 'active', $3, $4, $5)
 			RETURNING id, user_telegram_id, plan_code, status, starts_at,
-			          expires_at, quota_bytes, xui_email, created_at, updated_at`,
+			          expires_at, quota_bytes, created_at, updated_at`,
 			telegramID, plan.Code, now, expiresAt, plan.QuotaBytes,
 		), &subscription)
 	}
@@ -219,6 +297,14 @@ func (r *Repository) CompletePendingPayment(ctx context.Context, telegramID int6
 		WHERE id = $1`, paymentID, subscription.ID, now,
 	); err != nil {
 		return domain.Subscription{}, false, fmt.Errorf("mark payment paid: %w", err)
+	}
+	if updateID > 0 {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO telegram_payment_confirmations (update_id, user_telegram_id, subscription_id)
+			VALUES ($1, $2, $3)`, updateID, telegramID, subscription.ID,
+		); err != nil {
+			return domain.Subscription{}, false, fmt.Errorf("record payment confirmation idempotency: %w", err)
+		}
 	}
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO outbox_events (aggregate_type, aggregate_id, event_type, payload)
@@ -239,20 +325,6 @@ func (r *Repository) CompletePendingPayment(ctx context.Context, telegramID int6
 	return subscription, true, nil
 }
 
-func (r *Repository) HasPendingPayment(ctx context.Context, telegramID int64) (bool, error) {
-	var exists bool
-	err := r.pool.QueryRow(ctx, `
-		SELECT EXISTS (
-			SELECT 1 FROM payments
-			WHERE user_telegram_id = $1 AND provider = $2 AND status = 'pending'
-		)`, telegramID, betaPaymentProvider,
-	).Scan(&exists)
-	if err != nil {
-		return false, fmt.Errorf("check pending payment: %w", err)
-	}
-	return exists, nil
-}
-
 func lockSubscription(ctx context.Context, tx pgx.Tx, telegramID, preferredID int64, now time.Time) (domain.Subscription, bool, error) {
 	queries := make([]struct {
 		query string
@@ -264,9 +336,9 @@ func lockSubscription(ctx context.Context, tx pgx.Tx, telegramID, preferredID in
 			args  []any
 		}{`
 			SELECT id, user_telegram_id, plan_code, status, starts_at, expires_at,
-			       quota_bytes, xui_email, created_at, updated_at
+			       quota_bytes, created_at, updated_at
 			FROM subscriptions
-			WHERE id = $1 AND user_telegram_id = $2
+			WHERE id = $1 AND user_telegram_id = $2 AND status = 'active'
 			FOR UPDATE`, []any{preferredID, telegramID}})
 	}
 	queries = append(queries, struct {
@@ -274,7 +346,7 @@ func lockSubscription(ctx context.Context, tx pgx.Tx, telegramID, preferredID in
 		args  []any
 	}{`
 		SELECT id, user_telegram_id, plan_code, status, starts_at, expires_at,
-		       quota_bytes, xui_email, created_at, updated_at
+		       quota_bytes, created_at, updated_at
 		FROM subscriptions
 		WHERE user_telegram_id = $1 AND status = 'active'
 		  AND (expires_at IS NULL OR expires_at > $2)
@@ -306,7 +378,6 @@ func scanSubscription(row pgx.Row, subscription *domain.Subscription) error {
 		&startsAt,
 		&expiresAt,
 		&subscription.QuotaBytes,
-		&subscription.XUIEmail,
 		&subscription.CreatedAt,
 		&subscription.UpdatedAt,
 	); err != nil {
@@ -317,6 +388,173 @@ func scanSubscription(row pgx.Row, subscription *domain.Subscription) error {
 	}
 	if expiresAt != nil {
 		subscription.ExpiresAt = *expiresAt
+	}
+	return nil
+}
+
+func lockUser(ctx context.Context, tx pgx.Tx, telegramID int64) error {
+	var id int64
+	if err := tx.QueryRow(ctx, `
+		SELECT telegram_id FROM users WHERE telegram_id = $1 FOR UPDATE`, telegramID,
+	).Scan(&id); err != nil {
+		return fmt.Errorf("lock Telegram user %d: %w", telegramID, err)
+	}
+	return nil
+}
+
+func (r *Repository) UpsertPlan(ctx context.Context, plan domain.Plan) error {
+	durationDays := int(plan.Duration / (24 * time.Hour))
+	_, err := r.pool.Exec(ctx, `
+		INSERT INTO plans (code, name, duration_days, quota_bytes, amount_minor, currency)
+		VALUES ($1, $2, $3, $4, $5, $6)
+		ON CONFLICT (code) DO UPDATE SET
+			name = EXCLUDED.name,
+			duration_days = EXCLUDED.duration_days,
+			quota_bytes = EXCLUDED.quota_bytes,
+			amount_minor = EXCLUDED.amount_minor,
+			currency = EXCLUDED.currency,
+			updated_at = now()`,
+		plan.Code, plan.Name, durationDays, plan.QuotaBytes, plan.AmountMinor, plan.Currency,
+	)
+	if err != nil {
+		return fmt.Errorf("upsert plan %q: %w", plan.Code, err)
+	}
+	return nil
+}
+
+func (r *Repository) ClaimOutboxEvent(ctx context.Context) (domain.OutboxEvent, bool, error) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return domain.OutboxEvent{}, false, fmt.Errorf("begin outbox claim: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var event domain.OutboxEvent
+	err = tx.QueryRow(ctx, `
+		WITH candidate AS (
+			SELECT id
+			FROM outbox_events
+			WHERE processed_at IS NULL
+			  AND available_at <= now()
+			  AND (locked_at IS NULL OR locked_at < now() - interval '5 minutes')
+			ORDER BY available_at, created_at, id
+			LIMIT 1
+			FOR UPDATE SKIP LOCKED
+		)
+		UPDATE outbox_events AS event
+		SET locked_at = now(), attempts = attempts + 1
+		FROM candidate
+		WHERE event.id = candidate.id
+		RETURNING event.id, event.event_type,
+		          COALESCE((event.payload->>'telegram_id')::bigint, 0), event.attempts`,
+	).Scan(&event.ID, &event.EventType, &event.TelegramID, &event.Attempts)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.OutboxEvent{}, false, nil
+	}
+	if err != nil {
+		return domain.OutboxEvent{}, false, fmt.Errorf("claim outbox event: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.OutboxEvent{}, false, fmt.Errorf("commit outbox claim: %w", err)
+	}
+	return event, true, nil
+}
+
+func (r *Repository) MarkOutboxProcessed(ctx context.Context, eventID int64) error {
+	result, err := r.pool.Exec(ctx, `
+		UPDATE outbox_events
+		SET processed_at = now(), locked_at = NULL, last_error = ''
+		WHERE id = $1 AND processed_at IS NULL`, eventID,
+	)
+	if err != nil {
+		return fmt.Errorf("mark outbox event %d processed: %w", eventID, err)
+	}
+	if result.RowsAffected() != 1 {
+		return fmt.Errorf("outbox event %d is no longer pending", eventID)
+	}
+	return nil
+}
+
+func (r *Repository) MarkOutboxFailed(ctx context.Context, eventID int64, retryAfter time.Duration, cause error) error {
+	message := cause.Error()
+	runes := []rune(message)
+	if len(runes) > 1000 {
+		message = string(runes[:1000])
+	}
+	_, err := r.pool.Exec(ctx, `
+		UPDATE outbox_events
+		SET locked_at = NULL,
+		    available_at = now() + $2::interval,
+		    last_error = $3
+		WHERE id = $1 AND processed_at IS NULL`,
+		eventID, retryAfter.String(), message,
+	)
+	if err != nil {
+		return fmt.Errorf("schedule retry for outbox event %d: %w", eventID, err)
+	}
+	return nil
+}
+
+func (r *Repository) PaymentCodeAllowed(ctx context.Context, telegramID int64, now time.Time) (bool, error) {
+	var blockedUntil *time.Time
+	err := r.pool.QueryRow(ctx, `
+		SELECT payment_code_blocked_until FROM users WHERE telegram_id = $1`, telegramID,
+	).Scan(&blockedUntil)
+	if err != nil {
+		return false, fmt.Errorf("read payment code rate limit: %w", err)
+	}
+	return blockedUntil == nil || !now.Before(*blockedUntil), nil
+}
+
+func (r *Repository) RecordPaymentCodeFailure(ctx context.Context, telegramID int64, now time.Time) error {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin payment code rate limit: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := lockUser(ctx, tx, telegramID); err != nil {
+		return err
+	}
+
+	var failures int
+	var blockedUntil *time.Time
+	if err := tx.QueryRow(ctx, `
+		SELECT payment_code_failures, payment_code_blocked_until
+		FROM users WHERE telegram_id = $1`, telegramID,
+	).Scan(&failures, &blockedUntil); err != nil {
+		return fmt.Errorf("read payment code failures: %w", err)
+	}
+	if blockedUntil != nil && !now.Before(*blockedUntil) {
+		failures = 0
+		blockedUntil = nil
+	}
+	failures++
+	if failures >= maxPaymentCodeFailures {
+		until := now.Add(paymentCodeBlockPeriod)
+		blockedUntil = &until
+		failures = 0
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE users
+		SET payment_code_failures = $2, payment_code_blocked_until = $3, updated_at = now()
+		WHERE telegram_id = $1`, telegramID, failures, blockedUntil,
+	); err != nil {
+		return fmt.Errorf("update payment code failures: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit payment code failure: %w", err)
+	}
+	return nil
+}
+
+func (r *Repository) ResetPaymentCodeFailures(ctx context.Context, telegramID int64) error {
+	_, err := r.pool.Exec(ctx, `
+		UPDATE users
+		SET payment_code_failures = 0, payment_code_blocked_until = NULL, updated_at = now()
+		WHERE telegram_id = $1`, telegramID,
+	)
+	if err != nil {
+		return fmt.Errorf("reset payment code failures: %w", err)
 	}
 	return nil
 }

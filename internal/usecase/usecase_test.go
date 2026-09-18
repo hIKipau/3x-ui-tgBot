@@ -11,17 +11,25 @@ import (
 )
 
 type repositoryStub struct {
-	user         domain.User
-	subscription domain.Subscription
-	hasActive    bool
-	boundEmail   string
-	payment      *domain.CheckoutRequest
-	completed    bool
+	user          domain.User
+	subscription  domain.Subscription
+	hasActive     bool
+	boundEmail    string
+	payment       *domain.CheckoutRequest
+	completed     bool
+	confirmations map[int64]domain.Subscription
 }
 
 func (r *repositoryStub) UpsertUser(_ context.Context, user domain.User) (domain.User, error) {
 	r.user = user
 	return user, nil
+}
+
+func (r *repositoryStub) UserByTelegramID(context.Context, int64) (domain.User, bool, error) {
+	if r.user.TelegramID == 0 {
+		return domain.User{}, false, nil
+	}
+	return r.user, true, nil
 }
 
 func (r *repositoryStub) ActiveSubscription(context.Context, int64, time.Time) (domain.Subscription, bool, error) {
@@ -37,16 +45,34 @@ func (r *repositoryStub) BindXUIClient(_ context.Context, _ int64, email string)
 	return nil
 }
 
+func (r *repositoryStub) VPNAccountEmail(context.Context, int64) (string, bool, error) {
+	if r.boundEmail == "" {
+		return "", false, nil
+	}
+	return r.boundEmail, true, nil
+}
+
+func (r *repositoryStub) PaymentCodeAllowed(context.Context, int64, time.Time) (bool, error) {
+	return true, nil
+}
+
+func (r *repositoryStub) RecordPaymentCodeFailure(context.Context, int64, time.Time) error {
+	return nil
+}
+
+func (r *repositoryStub) ResetPaymentCodeFailures(context.Context, int64) error {
+	return nil
+}
+
 func (r *repositoryStub) CreatePendingPayment(_ context.Context, request domain.CheckoutRequest, _ string) error {
 	r.payment = &request
 	return nil
 }
 
-func (r *repositoryStub) HasPendingPayment(context.Context, int64) (bool, error) {
-	return r.payment != nil && !r.completed, nil
-}
-
-func (r *repositoryStub) CompletePendingPayment(_ context.Context, telegramID int64, plan domain.Plan, now time.Time) (domain.Subscription, bool, error) {
+func (r *repositoryStub) CompletePendingPayment(_ context.Context, telegramID, updateID int64, plan domain.Plan, now time.Time) (domain.Subscription, bool, error) {
+	if subscription, ok := r.confirmations[updateID]; updateID > 0 && ok {
+		return subscription, true, nil
+	}
 	if r.payment == nil || r.completed {
 		return domain.Subscription{}, false, nil
 	}
@@ -61,6 +87,12 @@ func (r *repositoryStub) CompletePendingPayment(_ context.Context, telegramID in
 		ExpiresAt: base.Add(plan.Duration), QuotaBytes: plan.QuotaBytes,
 	}
 	r.hasActive = true
+	if updateID > 0 {
+		if r.confirmations == nil {
+			r.confirmations = make(map[int64]domain.Subscription)
+		}
+		r.confirmations[updateID] = r.subscription
+	}
 	return r.subscription, true, nil
 }
 
@@ -119,7 +151,7 @@ func TestBuyAndConfirmPaymentCodeActivatesSubscriptionOnce(t *testing.T) {
 	service := newTestService(repository, &panelStub{})
 	user := domain.User{TelegramID: 42, Username: "alice"}
 
-	checkout, err := service.Buy(context.Background(), user)
+	checkout, err := service.Buy(context.Background(), user, 101)
 	if err != nil {
 		t.Fatalf("Buy() error = %v", err)
 	}
@@ -127,15 +159,19 @@ func TestBuyAndConfirmPaymentCodeActivatesSubscriptionOnce(t *testing.T) {
 		t.Fatalf("checkout=%#v payment=%#v", checkout, repository.payment)
 	}
 
-	subscription, err := service.ConfirmPaymentCode(context.Background(), user, "valid")
+	subscription, err := service.ConfirmPaymentCode(context.Background(), user, "valid", 102)
 	if err != nil {
 		t.Fatalf("ConfirmPaymentCode() error = %v", err)
 	}
 	if subscription.Status != domain.SubscriptionActive || subscription.ExpiresAt.IsZero() {
 		t.Fatalf("subscription = %#v", subscription)
 	}
-	if _, err := service.ConfirmPaymentCode(context.Background(), user, "valid"); err != ErrNoPendingPayment {
-		t.Fatalf("second ConfirmPaymentCode() error = %v", err)
+	replayed, err := service.ConfirmPaymentCode(context.Background(), user, "valid", 102)
+	if err != nil || replayed.ID != subscription.ID || !replayed.ExpiresAt.Equal(subscription.ExpiresAt) {
+		t.Fatalf("replayed ConfirmPaymentCode() subscription=%#v error=%v", replayed, err)
+	}
+	if _, err := service.ConfirmPaymentCode(context.Background(), user, "valid", 103); err != ErrNoPendingPayment {
+		t.Fatalf("new ConfirmPaymentCode() without pending payment error = %v", err)
 	}
 }
 
@@ -144,7 +180,7 @@ func TestConfirmPaymentCodeRejectsInvalidCode(t *testing.T) {
 	service := newTestService(repository, &panelStub{})
 	service.payments = paymentStub{valid: false}
 
-	if _, err := service.ConfirmPaymentCode(context.Background(), domain.User{TelegramID: 42}, "invalid"); err != ErrInvalidPaymentCode {
+	if _, err := service.ConfirmPaymentCode(context.Background(), domain.User{TelegramID: 42}, "invalid", 104); err != ErrInvalidPaymentCode {
 		t.Fatalf("ConfirmPaymentCode() error = %v", err)
 	}
 }
@@ -205,9 +241,10 @@ func TestClientEmailFallsBackToTelegramIDWithoutUsername(t *testing.T) {
 func TestGetConfigSynchronizesExistingClient(t *testing.T) {
 	now := time.Date(2026, 9, 18, 10, 0, 0, 0, time.UTC)
 	repository := &repositoryStub{hasActive: true, subscription: domain.Subscription{
-		ID: 7, Status: domain.SubscriptionActive, ExpiresAt: now.Add(time.Hour), XUIEmail: "alice",
+		ID: 7, Status: domain.SubscriptionActive, ExpiresAt: now.Add(time.Hour),
 	}}
 	panel := &panelStub{clients: []domain.Client{{Email: "alice"}}}
+	repository.boundEmail = "alice"
 	service := newTestService(repository, panel)
 
 	if _, err := service.RefreshConfig(context.Background(), 42, "Alice"); err != nil {

@@ -17,17 +17,22 @@ var (
 	ErrUserNotFound         = errors.New("user not found")
 	ErrSubscriptionRequired = errors.New("active subscription required")
 	ErrInvalidPaymentCode   = errors.New("invalid payment code")
+	ErrPaymentCodeRateLimit = errors.New("payment code rate limit exceeded")
 	ErrNoPendingPayment     = errors.New("pending payment not found")
 )
 
 type Repository interface {
 	UpsertUser(ctx context.Context, user domain.User) (domain.User, error)
+	UserByTelegramID(ctx context.Context, telegramID int64) (domain.User, bool, error)
 	LatestSubscription(ctx context.Context, telegramID int64) (domain.Subscription, bool, error)
 	ActiveSubscription(ctx context.Context, telegramID int64, now time.Time) (domain.Subscription, bool, error)
-	BindXUIClient(ctx context.Context, subscriptionID int64, email string) error
+	VPNAccountEmail(ctx context.Context, telegramID int64) (string, bool, error)
+	BindXUIClient(ctx context.Context, telegramID int64, email string) error
 	CreatePendingPayment(ctx context.Context, request domain.CheckoutRequest, providerPaymentID string) error
-	HasPendingPayment(ctx context.Context, telegramID int64) (bool, error)
-	CompletePendingPayment(ctx context.Context, telegramID int64, plan domain.Plan, now time.Time) (domain.Subscription, bool, error)
+	CompletePendingPayment(ctx context.Context, telegramID, updateID int64, plan domain.Plan, now time.Time) (domain.Subscription, bool, error)
+	PaymentCodeAllowed(ctx context.Context, telegramID int64, now time.Time) (bool, error)
+	RecordPaymentCodeFailure(ctx context.Context, telegramID int64, now time.Time) error
+	ResetPaymentCodeFailures(ctx context.Context, telegramID int64) error
 }
 
 type Panel interface {
@@ -110,7 +115,7 @@ func (s *Service) Status(ctx context.Context, telegramID int64) (domain.Profile,
 	return profile, nil
 }
 
-func (s *Service) Buy(ctx context.Context, user domain.User) (domain.Checkout, error) {
+func (s *Service) Buy(ctx context.Context, user domain.User, updateID int64) (domain.Checkout, error) {
 	profile, err := s.Start(ctx, user)
 	if err != nil {
 		return domain.Checkout{}, err
@@ -120,12 +125,12 @@ func (s *Service) Buy(ctx context.Context, user domain.User) (domain.Checkout, e
 		return domain.Checkout{}, fmt.Errorf("read subscription: %w", err)
 	}
 	if found {
-		return s.createCheckout(ctx, profile.User, domain.PurchaseExtension, active.ID)
+		return s.createCheckout(ctx, profile.User, domain.PurchaseExtension, active.ID, updateID)
 	}
-	return s.createCheckout(ctx, profile.User, domain.PurchaseNew, 0)
+	return s.createCheckout(ctx, profile.User, domain.PurchaseNew, 0, updateID)
 }
 
-func (s *Service) Extend(ctx context.Context, user domain.User) (domain.Checkout, error) {
+func (s *Service) Extend(ctx context.Context, user domain.User, updateID int64) (domain.Checkout, error) {
 	profile, err := s.Start(ctx, user)
 	if err != nil {
 		return domain.Checkout{}, err
@@ -137,13 +142,19 @@ func (s *Service) Extend(ctx context.Context, user domain.User) (domain.Checkout
 	if !found {
 		return domain.Checkout{}, ErrSubscriptionRequired
 	}
-	return s.createCheckout(ctx, profile.User, domain.PurchaseExtension, active.ID)
+	return s.createCheckout(ctx, profile.User, domain.PurchaseExtension, active.ID, updateID)
 }
 
-func (s *Service) createCheckout(ctx context.Context, user domain.User, kind domain.PurchaseKind, subscriptionID int64) (domain.Checkout, error) {
-	paymentID, err := newPaymentID()
-	if err != nil {
-		return domain.Checkout{}, fmt.Errorf("generate payment ID: %w", err)
+func (s *Service) createCheckout(ctx context.Context, user domain.User, kind domain.PurchaseKind, subscriptionID, updateID int64) (domain.Checkout, error) {
+	paymentID := ""
+	if updateID > 0 {
+		paymentID = fmt.Sprintf("telegram_%d", updateID)
+	} else {
+		var err error
+		paymentID, err = newPaymentID()
+		if err != nil {
+			return domain.Checkout{}, fmt.Errorf("generate payment ID: %w", err)
+		}
 	}
 	request := domain.CheckoutRequest{
 		User:           user,
@@ -160,21 +171,27 @@ func (s *Service) createCheckout(ctx context.Context, user domain.User, kind dom
 
 // ConfirmPaymentCode atomically consumes the latest pending payment and
 // activates or extends the subscription. A consumed payment cannot be reused.
-func (s *Service) ConfirmPaymentCode(ctx context.Context, user domain.User, code string) (domain.Subscription, error) {
+func (s *Service) ConfirmPaymentCode(ctx context.Context, user domain.User, code string, updateID int64) (domain.Subscription, error) {
 	if _, err := s.Start(ctx, user); err != nil {
 		return domain.Subscription{}, err
 	}
-	pending, err := s.repository.HasPendingPayment(ctx, user.TelegramID)
+	allowed, err := s.repository.PaymentCodeAllowed(ctx, user.TelegramID, s.now())
 	if err != nil {
-		return domain.Subscription{}, fmt.Errorf("check pending payment: %w", err)
+		return domain.Subscription{}, fmt.Errorf("check payment code rate limit: %w", err)
 	}
-	if !pending {
-		return domain.Subscription{}, ErrNoPendingPayment
+	if !allowed {
+		return domain.Subscription{}, ErrPaymentCodeRateLimit
 	}
 	if !s.payments.Verify(code) {
+		if err := s.repository.RecordPaymentCodeFailure(ctx, user.TelegramID, s.now()); err != nil {
+			return domain.Subscription{}, fmt.Errorf("record invalid payment code: %w", err)
+		}
 		return domain.Subscription{}, ErrInvalidPaymentCode
 	}
-	subscription, found, err := s.repository.CompletePendingPayment(ctx, user.TelegramID, s.policy.Plan, s.now())
+	if err := s.repository.ResetPaymentCodeFailures(ctx, user.TelegramID); err != nil {
+		return domain.Subscription{}, fmt.Errorf("reset payment code rate limit: %w", err)
+	}
+	subscription, found, err := s.repository.CompletePendingPayment(ctx, user.TelegramID, updateID, s.policy.Plan, s.now())
 	if err != nil {
 		return domain.Subscription{}, fmt.Errorf("complete pending payment: %w", err)
 	}
@@ -213,21 +230,52 @@ func (s *Service) RefreshConfig(ctx context.Context, telegramID int64, displayNa
 	return s.GetConfig(ctx, telegramID, displayName)
 }
 
+// SyncSubscription applies committed PostgreSQL access to 3x-ui. The outbox
+// worker retries this operation independently from the payment transaction.
+func (s *Service) SyncSubscription(ctx context.Context, telegramID int64) error {
+	subscription, found, err := s.repository.ActiveSubscription(ctx, telegramID, s.now())
+	if err != nil {
+		return fmt.Errorf("read active subscription for sync: %w", err)
+	}
+	if !found {
+		return nil
+	}
+	user, found, err := s.repository.UserByTelegramID(ctx, telegramID)
+	if err != nil {
+		return fmt.Errorf("read Telegram user for sync: %w", err)
+	}
+	if !found {
+		return ErrUserNotFound
+	}
+	_, err = s.ensurePanelClient(ctx, telegramID, user.DisplayName(), subscription)
+	return err
+}
+
 func (s *Service) ensurePanelClient(ctx context.Context, telegramID int64, displayName string, subscription domain.Subscription) (domain.Client, error) {
+	accountEmail, _, err := s.repository.VPNAccountEmail(ctx, telegramID)
+	if err != nil {
+		return domain.Client{}, fmt.Errorf("read VPN account: %w", err)
+	}
 	clients, err := s.panel.ClientsByTelegramID(ctx, telegramID)
 	if err != nil {
 		return domain.Client{}, fmt.Errorf("find 3x-ui client: %w", err)
 	}
 
 	desiredEmail := clientEmail(telegramID, displayName)
+	// The 3x-ui email is an external identity, not a live profile field. Keep
+	// the initially assigned nickname stable when the Telegram username changes
+	// or is later reassigned to another account.
+	if accountEmail != "" {
+		desiredEmail = accountEmail
+	}
 	for _, candidate := range clients {
-		if candidate.Email == subscription.XUIEmail || candidate.Email == desiredEmail || subscription.XUIEmail == "" {
+		if candidate.Email == accountEmail || candidate.Email == desiredEmail || accountEmail == "" {
 			client, syncErr := s.panel.SyncClientAccess(ctx, candidate.Email, desiredEmail, subscription.QuotaBytes, subscription.ExpiresAt)
 			if syncErr != nil {
 				return domain.Client{}, fmt.Errorf("synchronize 3x-ui client: %w", syncErr)
 			}
-			if subscription.XUIEmail != client.Email {
-				if err := s.repository.BindXUIClient(ctx, subscription.ID, client.Email); err != nil {
+			if accountEmail != client.Email {
+				if err := s.repository.BindXUIClient(ctx, telegramID, client.Email); err != nil {
 					return domain.Client{}, err
 				}
 			}
@@ -263,7 +311,7 @@ func (s *Service) ensurePanelClient(ctx context.Context, telegramID int64, displ
 			return domain.Client{}, fmt.Errorf("provision 3x-ui client: %w", err)
 		}
 	}
-	if err := s.repository.BindXUIClient(ctx, subscription.ID, client.Email); err != nil {
+	if err := s.repository.BindXUIClient(ctx, telegramID, client.Email); err != nil {
 		return domain.Client{}, err
 	}
 	s.logger.Info("3x-ui client provisioned", "telegram_id", telegramID, "email", client.Email)
@@ -294,8 +342,9 @@ func clientEmail(telegramID int64, displayName string) string {
 
 func sanitizeText(value string, limit int) string {
 	value = strings.Join(strings.Fields(value), " ")
-	if len(value) > limit {
-		value = value[:limit]
+	runes := []rune(value)
+	if len(runes) > limit {
+		value = string(runes[:limit])
 	}
 	return value
 }

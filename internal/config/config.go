@@ -2,6 +2,8 @@ package config
 
 import (
 	"bufio"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/url"
@@ -15,6 +17,7 @@ const gibibyte int64 = 1024 * 1024 * 1024
 
 type Config struct {
 	Env         string
+	Timezone    string
 	DatabaseURL string
 	Telegram    Telegram
 	Payment     Payment
@@ -36,6 +39,7 @@ type XUI struct {
 	APIToken           string
 	Timeout            time.Duration
 	InsecureSkipVerify bool
+	TLSCertSHA256      string
 }
 
 type VPN struct {
@@ -99,6 +103,7 @@ func Load() (*Config, error) {
 
 	cfg := &Config{
 		Env:         get("ENV", "local"),
+		Timezone:    get("APP_TIMEZONE", "Europe/Moscow"),
 		DatabaseURL: get("DATABASE_URL", ""),
 		Telegram: Telegram{
 			Token:       get("TELEGRAM_BOT_TOKEN", ""),
@@ -112,6 +117,7 @@ func Load() (*Config, error) {
 			APIToken:           get("XUI_API_TOKEN", ""),
 			Timeout:            xuiTimeout,
 			InsecureSkipVerify: insecureSkipVerify,
+			TLSCertSHA256:      strings.ToLower(strings.ReplaceAll(get("XUI_TLS_CERT_SHA256", ""), ":", "")),
 		},
 		VPN: VPN{
 			InboundIDs: inboundIDs,
@@ -165,14 +171,26 @@ func (cfg *Config) validate() error {
 	if cfg.Telegram.PollTimeout <= 0 || cfg.XUI.Timeout <= 0 || cfg.VPN.Duration <= 0 {
 		return fmt.Errorf("timeouts and VPN_DEFAULT_DURATION must be positive")
 	}
+	if cfg.VPN.Duration%(24*time.Hour) != 0 {
+		return fmt.Errorf("VPN_DEFAULT_DURATION must contain a whole number of days")
+	}
 	if cfg.VPN.PlanCode == "" || cfg.VPN.PlanName == "" {
 		return fmt.Errorf("VPN plan code and name must not be empty")
 	}
 	if cfg.VPN.Flow == "" {
 		return fmt.Errorf("VPN_CLIENT_FLOW must not be empty")
 	}
+	if cfg.XUI.InsecureSkipVerify {
+		fingerprint, err := hex.DecodeString(cfg.XUI.TLSCertSHA256)
+		if err != nil || len(fingerprint) != sha256.Size {
+			return fmt.Errorf("XUI_TLS_CERT_SHA256 must contain a SHA-256 certificate fingerprint when XUI_INSECURE_SKIP_VERIFY=true")
+		}
+	}
 	if len(cfg.VPN.Currency) != 3 {
 		return fmt.Errorf("VPN_PLAN_CURRENCY must be a three-letter code")
+	}
+	if _, err := time.LoadLocation(cfg.Timezone); err != nil {
+		return fmt.Errorf("load APP_TIMEZONE %q: %w", cfg.Timezone, err)
 	}
 	return nil
 }

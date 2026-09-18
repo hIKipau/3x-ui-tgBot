@@ -28,6 +28,7 @@ func TestBetaPaymentLifecycleIntegration(t *testing.T) {
 	telegramID := int64(8_000_000_000_000 + time.Now().UnixNano()%1_000_000_000)
 	t.Cleanup(func() {
 		_, _ = database.pool.Exec(ctx, `DELETE FROM outbox_events WHERE payload->>'telegram_id' = $1`, fmt.Sprint(telegramID))
+		_, _ = database.pool.Exec(ctx, `DELETE FROM telegram_payment_confirmations WHERE user_telegram_id = $1`, telegramID)
 		_, _ = database.pool.Exec(ctx, `DELETE FROM payments WHERE user_telegram_id = $1`, telegramID)
 		_, _ = database.pool.Exec(ctx, `DELETE FROM subscriptions WHERE user_telegram_id = $1`, telegramID)
 		_, _ = database.pool.Exec(ctx, `DELETE FROM users WHERE telegram_id = $1`, telegramID)
@@ -50,15 +51,16 @@ func TestBetaPaymentLifecycleIntegration(t *testing.T) {
 	}
 
 	now := time.Now().UTC().Truncate(time.Microsecond)
-	subscription, found, err := repository.CompletePendingPayment(ctx, telegramID, plan, now)
+	subscription, found, err := repository.CompletePendingPayment(ctx, telegramID, telegramID, plan, now)
 	if err != nil || !found {
 		t.Fatalf("CompletePendingPayment() found=%v error=%v", found, err)
 	}
 	if subscription.Status != domain.SubscriptionActive || !subscription.ExpiresAt.Equal(now.Add(plan.Duration)) {
 		t.Fatalf("subscription = %#v", subscription)
 	}
-	if _, found, err := repository.CompletePendingPayment(ctx, telegramID, plan, now); err != nil || found {
-		t.Fatalf("payment was reusable: found=%v error=%v", found, err)
+	replayed, found, err := repository.CompletePendingPayment(ctx, telegramID, telegramID, plan, now)
+	if err != nil || !found || replayed.ID != subscription.ID || !replayed.ExpiresAt.Equal(subscription.ExpiresAt) {
+		t.Fatalf("payment replay changed result: subscription=%#v found=%v error=%v", replayed, found, err)
 	}
 
 	request.Kind = domain.PurchaseExtension
@@ -67,11 +69,29 @@ func TestBetaPaymentLifecycleIntegration(t *testing.T) {
 	if err := repository.CreatePendingPayment(ctx, request, request.IdempotencyKey); err != nil {
 		t.Fatal(err)
 	}
-	extended, found, err := repository.CompletePendingPayment(ctx, telegramID, plan, now)
+	extended, found, err := repository.CompletePendingPayment(ctx, telegramID, telegramID+1, plan, now)
 	if err != nil || !found {
 		t.Fatalf("extend payment found=%v error=%v", found, err)
 	}
 	if !extended.ExpiresAt.Equal(subscription.ExpiresAt.Add(plan.Duration)) {
 		t.Fatalf("extended expiry=%v, want %v", extended.ExpiresAt, subscription.ExpiresAt.Add(plan.Duration))
+	}
+
+	if err := repository.BindXUIClient(ctx, telegramID, "@integration"); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.BindXUIClient(ctx, telegramID, "@integration"); err != nil {
+		t.Fatalf("VPN account binding is not idempotent: %v", err)
+	}
+	for range maxPaymentCodeFailures {
+		if err := repository.RecordPaymentCodeFailure(ctx, telegramID, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if allowed, err := repository.PaymentCodeAllowed(ctx, telegramID, now); err != nil || allowed {
+		t.Fatalf("payment code rate limit allowed=%v error=%v", allowed, err)
+	}
+	if err := repository.ResetPaymentCodeFailures(ctx, telegramID); err != nil {
+		t.Fatal(err)
 	}
 }

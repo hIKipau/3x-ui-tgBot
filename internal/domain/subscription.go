@@ -19,7 +19,6 @@ type Subscription struct {
 	StartsAt       time.Time
 	ExpiresAt      time.Time
 	QuotaBytes     int64
-	XUIEmail       string
 	CreatedAt      time.Time
 	UpdatedAt      time.Time
 }
