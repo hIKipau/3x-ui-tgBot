@@ -1,0 +1,61 @@
+name: x-ui-tgbot
+
+services:
+  postgres:
+    image: postgres:18.6-alpine3.23
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-xui_tgbot}
+      POSTGRES_USER: ${POSTGRES_USER:-xui_bot}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-xui_bot_local_password}
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    security_opt:
+      - no-new-privileges:true
+
+  migrator:
+    image: migrate/migrate:v4.19.1
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./migrations:/migrations:ro
+    command:
+      - -path=/migrations
+      - -database=postgres://${POSTGRES_USER:-xui_bot}:${POSTGRES_PASSWORD:-xui_bot_local_password}@postgres:5432/${POSTGRES_DB:-xui_tgbot}?sslmode=disable
+      - up
+    security_opt:
+      - no-new-privileges:true
+
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    init: true
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-xui_bot}:${POSTGRES_PASSWORD:-xui_bot_local_password}@postgres:5432/${POSTGRES_DB:-xui_tgbot}?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrator:
+        condition: service_completed_successfully
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  postgres_data:

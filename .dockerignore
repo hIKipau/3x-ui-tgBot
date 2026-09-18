@@ -1,0 +1,11 @@
+.git
+.gitignore
+.idea
+.env
+bin
+coverage.out
+Dockerfile*
+docker-compose*.yml
+docker-compose*.yaml
+README.md
+

@@ -1,0 +1,9 @@
+BEGIN;
+
+DROP TABLE IF EXISTS outbox_events;
+DROP TABLE IF EXISTS payments;
+DROP TABLE IF EXISTS subscriptions;
+DROP TABLE IF EXISTS plans;
+DROP TABLE IF EXISTS users;
+
+COMMIT;
