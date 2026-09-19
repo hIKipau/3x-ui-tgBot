@@ -77,6 +77,15 @@ make migrate-up       # применить новые миграции
 make migrate-down     # откатить одну миграцию
 ```
 
+Итоговая схема для ручного создания пустой БД находится в
+[`database/schema.sql`](database/schema.sql). Инструкция и безопасные команды
+полного переноса существующих данных на сервер находятся в
+[`database/README.md`](database/README.md). Полный дамп можно создать командой:
+
+```bash
+make db-backup
+```
+
 API token создаётся в 3x-ui в `Settings -> Security -> API Token`. Он имеет
 администраторские права и не должен попадать в git или логи.
 

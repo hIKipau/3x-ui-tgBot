@@ -2,4 +2,7 @@
 .idea/
 bin/
 coverage.out
-
+backups/
+*.dump
+database
+scripts
