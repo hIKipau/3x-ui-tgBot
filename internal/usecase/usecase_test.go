@@ -238,7 +238,7 @@ func TestClientEmailFallsBackToTelegramIDWithoutUsername(t *testing.T) {
 	}
 }
 
-func TestGetConfigSynchronizesExistingClient(t *testing.T) {
+func TestGetConfigKeepsExistingVPNAccountIdentity(t *testing.T) {
 	now := time.Date(2026, 9, 18, 10, 0, 0, 0, time.UTC)
 	repository := &repositoryStub{hasActive: true, subscription: domain.Subscription{
 		ID: 7, Status: domain.SubscriptionActive, ExpiresAt: now.Add(time.Hour),
@@ -251,8 +251,14 @@ func TestGetConfigSynchronizesExistingClient(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !panel.synced || panel.created != nil || panel.syncedFromEmail != "alice" ||
-		panel.syncedToEmail != "tg-42" || repository.boundEmail != "tg-42" {
+		panel.syncedToEmail != "alice" || repository.boundEmail != "alice" {
 		t.Fatalf("synced=%v from=%q to=%q bound=%q created=%#v",
 			panel.synced, panel.syncedFromEmail, panel.syncedToEmail, repository.boundEmail, panel.created)
+	}
+}
+
+func TestSanitizeTextDoesNotSplitUnicode(t *testing.T) {
+	if got := sanitizeText("🙂🙂🙂", 2); got != "🙂🙂" {
+		t.Fatalf("sanitizeText() = %q", got)
 	}
 }
