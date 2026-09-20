@@ -171,6 +171,73 @@ func TestSyncClientAccessNormalizesClientRecord(t *testing.T) {
 	}
 }
 
+func TestAvailableInboundIDsReturnsOnlyEnabledSorted(t *testing.T) {
+	httpClient := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method != http.MethodGet || r.URL.Path != "/secret/panel/api/inbounds/list/slim" {
+			t.Fatalf("request = %s %s", r.Method, r.URL.Path)
+		}
+		body, err := json.Marshal(map[string]any{
+			"success": true,
+			"obj": []any{
+				map[string]any{"id": 8, "enable": true},
+				map[string]any{"id": 3, "enable": false},
+				map[string]any{"id": 2, "enable": true},
+			},
+		})
+		if err != nil {
+			return nil, err
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(bytes.NewReader(body)),
+			Request:    r,
+		}, nil
+	})}
+
+	client, err := New("https://panel.example/secret", "secret", httpClient, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids, err := client.AvailableInboundIDs(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ids) != 2 || ids[0] != 2 || ids[1] != 8 {
+		t.Fatalf("inbound IDs = %#v", ids)
+	}
+}
+
+func TestAttachClientToInbounds(t *testing.T) {
+	httpClient := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method != http.MethodPost || r.URL.Path != "/secret/panel/api/clients/@alice/attach" {
+			t.Fatalf("request = %s %s", r.Method, r.URL.Path)
+		}
+		var body attachClientRequest
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if len(body.InboundIDs) != 2 || body.InboundIDs[0] != 7 || body.InboundIDs[1] != 8 {
+			t.Fatalf("body = %#v", body)
+		}
+		response := []byte(`{"success":true,"obj":null}`)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(bytes.NewReader(response)),
+			Request:    r,
+		}, nil
+	})}
+
+	client, err := New("https://panel.example/secret", "secret", httpClient, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.AttachClientToInbounds(context.Background(), "@alice", []int64{7, 8}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (fn roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {

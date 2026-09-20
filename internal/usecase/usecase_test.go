@@ -97,12 +97,15 @@ func (r *repositoryStub) CompletePendingPayment(_ context.Context, telegramID, u
 }
 
 type panelStub struct {
-	clients         []domain.Client
-	links           []string
-	created         *domain.NewClient
-	synced          bool
-	syncedFromEmail string
-	syncedToEmail   string
+	clients             []domain.Client
+	links               []string
+	availableInboundIDs []int64
+	attachedInboundIDs  []int64
+	attachEmail         string
+	created             *domain.NewClient
+	synced              bool
+	syncedFromEmail     string
+	syncedToEmail       string
 }
 
 func (p *panelStub) ClientsByTelegramID(context.Context, int64) ([]domain.Client, error) {
@@ -121,7 +124,27 @@ func (p *panelStub) SyncClientAccess(_ context.Context, currentEmail, desiredEma
 	p.synced = true
 	p.syncedFromEmail = currentEmail
 	p.syncedToEmail = desiredEmail
-	return domain.Client{Email: desiredEmail, SubID: "sub-42", Enabled: true, QuotaBytes: quota, ExpiryAt: expiry}, nil
+	var inboundIDs []int64
+	for _, client := range p.clients {
+		if client.Email == currentEmail {
+			inboundIDs = append(inboundIDs, client.InboundIDs...)
+			break
+		}
+	}
+	return domain.Client{
+		Email: desiredEmail, SubID: "sub-42", Enabled: true,
+		QuotaBytes: quota, ExpiryAt: expiry, InboundIDs: inboundIDs,
+	}, nil
+}
+
+func (p *panelStub) AvailableInboundIDs(context.Context) ([]int64, error) {
+	return append([]int64(nil), p.availableInboundIDs...), nil
+}
+
+func (p *panelStub) AttachClientToInbounds(_ context.Context, email string, inboundIDs []int64) error {
+	p.attachEmail = email
+	p.attachedInboundIDs = append([]int64(nil), inboundIDs...)
+	return nil
 }
 
 func (p *panelStub) ClientLinks(context.Context, string) ([]string, error) {
@@ -254,6 +277,62 @@ func TestGetConfigKeepsExistingVPNAccountIdentity(t *testing.T) {
 		panel.syncedToEmail != "alice" || repository.boundEmail != "alice" {
 		t.Fatalf("synced=%v from=%q to=%q bound=%q created=%#v",
 			panel.synced, panel.syncedFromEmail, panel.syncedToEmail, repository.boundEmail, panel.created)
+	}
+}
+
+func TestRefreshConfigAttachesAllMissingAvailableInbounds(t *testing.T) {
+	now := time.Date(2026, 9, 18, 10, 0, 0, 0, time.UTC)
+	repository := &repositoryStub{
+		hasActive:  true,
+		boundEmail: "@alice",
+		subscription: domain.Subscription{
+			ID: 7, UserTelegramID: 42, Status: domain.SubscriptionActive,
+			StartsAt: now.Add(-time.Hour), ExpiresAt: now.Add(time.Hour),
+		},
+	}
+	panel := &panelStub{
+		clients:             []domain.Client{{Email: "@alice", InboundIDs: []int64{2, 3}}},
+		availableInboundIDs: []int64{2, 3, 7, 8, 8},
+		links:               []string{"vless://two", "vless://three", "vless://seven", "vless://eight"},
+	}
+	service := newTestService(repository, panel)
+
+	access, err := service.RefreshConfig(context.Background(), 42, "@alice")
+	if err != nil {
+		t.Fatalf("RefreshConfig() error = %v", err)
+	}
+	if panel.attachEmail != "@alice" {
+		t.Fatalf("attach email = %q", panel.attachEmail)
+	}
+	if len(panel.attachedInboundIDs) != 2 || panel.attachedInboundIDs[0] != 7 || panel.attachedInboundIDs[1] != 8 {
+		t.Fatalf("attached inbound IDs = %#v", panel.attachedInboundIDs)
+	}
+	if len(access.Links) != 4 {
+		t.Fatalf("links = %#v", access.Links)
+	}
+}
+
+func TestGetConfigDoesNotAttachNewInbounds(t *testing.T) {
+	now := time.Date(2026, 9, 18, 10, 0, 0, 0, time.UTC)
+	repository := &repositoryStub{
+		hasActive:  true,
+		boundEmail: "@alice",
+		subscription: domain.Subscription{
+			ID: 7, UserTelegramID: 42, Status: domain.SubscriptionActive,
+			StartsAt: now.Add(-time.Hour), ExpiresAt: now.Add(time.Hour),
+		},
+	}
+	panel := &panelStub{
+		clients:             []domain.Client{{Email: "@alice", InboundIDs: []int64{2}}},
+		availableInboundIDs: []int64{2, 3},
+	}
+	service := newTestService(repository, panel)
+
+	if _, err := service.GetConfig(context.Background(), 42, "@alice"); err != nil {
+		t.Fatalf("GetConfig() error = %v", err)
+	}
+	if len(panel.attachedInboundIDs) != 0 {
+		t.Fatalf("attached inbound IDs = %#v", panel.attachedInboundIDs)
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -103,6 +104,33 @@ func (c *Client) ClientLinks(ctx context.Context, email string) ([]string, error
 		return nil, err
 	}
 	return links, nil
+}
+
+// AvailableInboundIDs returns every enabled inbound. Disabled inbounds cannot
+// provide a working configuration and are deliberately excluded.
+func (c *Client) AvailableInboundIDs(ctx context.Context) ([]int64, error) {
+	var payload []apiInbound
+	if err := c.do(ctx, http.MethodGet, "/panel/api/inbounds/list/slim", nil, &payload); err != nil {
+		return nil, err
+	}
+	ids := make([]int64, 0, len(payload))
+	for _, inbound := range payload {
+		if inbound.ID > 0 && inbound.Enable {
+			ids = append(ids, inbound.ID)
+		}
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids, nil
+}
+
+// AttachClientToInbounds adds associations without touching the client's
+// credentials or removing any existing inbound associations.
+func (c *Client) AttachClientToInbounds(ctx context.Context, email string, inboundIDs []int64) error {
+	if len(inboundIDs) == 0 {
+		return nil
+	}
+	path := "/panel/api/clients/" + url.PathEscape(email) + "/attach"
+	return c.do(ctx, http.MethodPost, path, attachClientRequest{InboundIDs: inboundIDs}, nil)
 }
 
 // SyncClientAccess preserves protocol credentials returned by 3x-ui, applies
@@ -290,6 +318,15 @@ type apiEnvelope struct {
 type createClientRequest struct {
 	Client     apiClient `json:"client"`
 	InboundIDs []int64   `json:"inboundIds"`
+}
+
+type attachClientRequest struct {
+	InboundIDs []int64 `json:"inboundIds"`
+}
+
+type apiInbound struct {
+	ID     int64 `json:"id"`
+	Enable bool  `json:"enable"`
 }
 
 type apiClientView struct {

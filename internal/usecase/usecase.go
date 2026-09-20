@@ -39,6 +39,8 @@ type Panel interface {
 	ClientsByTelegramID(ctx context.Context, telegramID int64) ([]domain.Client, error)
 	CreateClient(ctx context.Context, client domain.NewClient) (domain.Client, error)
 	SyncClientAccess(ctx context.Context, currentEmail, desiredEmail string, quotaBytes int64, expiresAt time.Time) (domain.Client, error)
+	AvailableInboundIDs(ctx context.Context) ([]int64, error)
+	AttachClientToInbounds(ctx context.Context, email string, inboundIDs []int64) error
 	ClientLinks(ctx context.Context, email string) ([]string, error)
 }
 
@@ -205,6 +207,10 @@ func (s *Service) ConfirmPaymentCode(ctx context.Context, user domain.User, code
 // GetConfig checks PostgreSQL first. Only an active subscription may create or
 // synchronize a 3x-ui client.
 func (s *Service) GetConfig(ctx context.Context, telegramID int64, displayName string) (domain.Access, error) {
+	return s.getConfig(ctx, telegramID, displayName, false)
+}
+
+func (s *Service) getConfig(ctx context.Context, telegramID int64, displayName string, refreshInbounds bool) (domain.Access, error) {
 	subscription, found, err := s.repository.ActiveSubscription(ctx, telegramID, s.now())
 	if err != nil {
 		return domain.Access{}, fmt.Errorf("read subscription: %w", err)
@@ -217,6 +223,19 @@ func (s *Service) GetConfig(ctx context.Context, telegramID int64, displayName s
 	if err != nil {
 		return domain.Access{}, err
 	}
+	if refreshInbounds {
+		availableInboundIDs, err := s.panel.AvailableInboundIDs(ctx)
+		if err != nil {
+			return domain.Access{}, fmt.Errorf("list available 3x-ui inbounds: %w", err)
+		}
+		missingInboundIDs := missingIDs(client.InboundIDs, availableInboundIDs)
+		if len(missingInboundIDs) > 0 {
+			if err := s.panel.AttachClientToInbounds(ctx, client.Email, missingInboundIDs); err != nil {
+				return domain.Access{}, fmt.Errorf("attach 3x-ui client to available inbounds: %w", err)
+			}
+			client.InboundIDs = append(client.InboundIDs, missingInboundIDs...)
+		}
+	}
 	links, err := s.panel.ClientLinks(ctx, client.Email)
 	if err != nil {
 		return domain.Access{}, fmt.Errorf("get 3x-ui client links: %w", err)
@@ -227,7 +246,7 @@ func (s *Service) GetConfig(ctx context.Context, telegramID int64, displayName s
 // RefreshConfig synchronizes quota/expiry and asks 3x-ui to render current
 // links again. It deliberately does not rotate credentials and break devices.
 func (s *Service) RefreshConfig(ctx context.Context, telegramID int64, displayName string) (domain.Access, error) {
-	return s.GetConfig(ctx, telegramID, displayName)
+	return s.getConfig(ctx, telegramID, displayName, true)
 }
 
 // SyncSubscription applies committed PostgreSQL access to 3x-ui. The outbox
@@ -338,6 +357,25 @@ func clientEmail(telegramID int64, displayName string) string {
 		}
 	}
 	return fmt.Sprintf("tg-%d", telegramID)
+}
+
+func missingIDs(current, available []int64) []int64 {
+	attached := make(map[int64]struct{}, len(current))
+	for _, id := range current {
+		attached[id] = struct{}{}
+	}
+	missing := make([]int64, 0, len(available))
+	for _, id := range available {
+		if id <= 0 {
+			continue
+		}
+		if _, exists := attached[id]; exists {
+			continue
+		}
+		attached[id] = struct{}{}
+		missing = append(missing, id)
+	}
+	return missing
 }
 
 func sanitizeText(value string, limit int) string {
